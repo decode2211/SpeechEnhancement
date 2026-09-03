@@ -1,5 +1,19 @@
 # Speech enhancement datasets
 data/raw/*.zip
 data/raw/*_wav/
+data/
 *.wav
 *.crdownload
+
+# Environment / caches
+venv/
+__pycache__/
+.ipynb_checkpoints/
+
+# Model artifacts
+checkpoints/
+*.pt
+*.npy
+
+# Stale/regenerable audit output
+dataset_audit_*.csv
