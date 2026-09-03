@@ -15,7 +15,9 @@ Changes vs the README skeleton:
   no feedback for minutes looks hung.
 """
 
+import csv
 import os
+import time
 
 import torch
 import yaml
@@ -79,6 +81,7 @@ def main():
     si_sdr_weight = train_cfg.get("si_sdr_weight", 0.0)
     base_ch = train_cfg.get("base_ch", 32)
     checkpoint_path = train_cfg.get("checkpoint_path", "checkpoints/unet_se.pt")
+    log_path = train_cfg.get("log_path", "results/train_log.csv")
     num_workers = train_cfg.get("num_workers", 2)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,20 +106,33 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     best_val_loss = float("inf")
+    best_epoch = None
 
-    for epoch in range(epochs):
-        train_loss = run_epoch(model, train_loader, optimizer, device, si_sdr_weight, train=True)
-        val_loss = run_epoch(model, val_loader, optimizer, device, si_sdr_weight, train=False)
+    with open(log_path, "w", newline="") as log_file:
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(["epoch", "train_loss", "val_loss", "is_best", "wall_clock_sec"])
+        run_start = time.time()
 
-        print(f"Epoch {epoch + 1}/{epochs} - train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}")
+        for epoch in range(epochs):
+            train_loss = run_epoch(model, train_loader, optimizer, device, si_sdr_weight, train=True)
+            val_loss = run_epoch(model, val_loader, optimizer, device, si_sdr_weight, train=False)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"  ↳ new best val_loss, saved checkpoint to {checkpoint_path}")
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                best_epoch = epoch + 1
+                torch.save(model.state_dict(), checkpoint_path)
 
-    print(f"[train] done. Best val_loss: {best_val_loss:.4f}. Checkpoint: {checkpoint_path}")
+            print(f"Epoch {epoch + 1}/{epochs} - train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}"
+                  + ("  <- new best, saved checkpoint" if is_best else ""))
+
+            log_writer.writerow([epoch + 1, train_loss, val_loss, is_best, round(time.time() - run_start, 1)])
+            log_file.flush()  # survive a crash/kill mid-run with partial progress intact
+
+    print(f"[train] done. Best val_loss: {best_val_loss:.4f} at epoch {best_epoch}. "
+          f"Checkpoint: {checkpoint_path}. Log: {log_path}")
 
 
 if __name__ == "__main__":
