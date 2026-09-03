@@ -541,6 +541,19 @@ metric, including STOI, which the baseline alone couldn't do relative to the noi
 spectral subtraction's musical-noise artifacts cost a little intelligibility even while
 improving perceived quality and SNR, but the learned mask recovers past that.
 
+**Limitations.** This run's checkpoint selection is biased: `train.py` at the time built its
+validation set from the same test directories `evaluate.py` then scored, so epoch 18 was picked
+for minimizing loss on the exact 824 files the PESQ/STOI/SI-SDR numbers above come from. No
+gradient updates ever touched the test set — this is model-selection leakage, not train/test
+contamination — but it does mean "epoch 18 is best" was decided by peeking at the test score,
+not a held-out proxy for it. The likely size of the bias is small: val loss in
+`results/training_curve.png` is flat/noisy from roughly epoch 10 onward rather than sharply
+peaked at 18, and the margin over baseline (PESQ 2.746 vs 2.320) is far larger than plausible
+selection noise from picking among a handful of similar late-training epochs. `src/train.py` now
+builds a speaker-disjoint held-out validation split from the training set (`p230`, `p274` held
+out — see `results/val_split.json`) instead, so future runs won't have this issue; the numbers
+above predate that fix and haven't been re-run yet.
+
 ---
 
 ## 7. Roadmap / Milestones
