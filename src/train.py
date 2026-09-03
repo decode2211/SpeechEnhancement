@@ -41,13 +41,16 @@ def run_epoch(model, loader, optimizer, device, si_sdr_weight, train=True):
 
     with torch.set_grad_enabled(train):
         for noisy_mag, clean_mag, _noisy_phase in tqdm(loader, desc="train" if train else "val", leave=False):
-            noisy_mag = noisy_mag.unsqueeze(1).to(device)   # (B,1,F,T)
+            noisy_mag = noisy_mag.unsqueeze(1).to(device)   # (B,1,F,T), linear magnitude
             clean_mag = clean_mag.unsqueeze(1).to(device)
 
-            mask = model(noisy_mag)
+            # Network sees log-compressed input; mask is applied to LINEAR
+            # magnitude (a 0-1 multiplicative mask is only meaningful there);
+            # loss is then compared in log domain to match clean_mag's scale.
+            mask = model(torch.log1p(noisy_mag))
             pred_mag = mask * noisy_mag
 
-            loss = combined_loss(pred_mag, clean_mag, si_sdr_weight=si_sdr_weight)
+            loss = combined_loss(torch.log1p(pred_mag), torch.log1p(clean_mag), si_sdr_weight=si_sdr_weight)
 
             if train:
                 optimizer.zero_grad()

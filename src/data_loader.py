@@ -97,11 +97,10 @@ class NoisyCleanDataset(Dataset):
         noisy_mag, noisy_phase = magnitude_phase(noisy_spec)
         clean_mag, _ = magnitude_phase(clean_spec)
 
-        # log-magnitude compresses dynamic range, standard for speech enhancement
-        noisy_mag_log = torch.log1p(noisy_mag)
-        clean_mag_log = torch.log1p(clean_mag)
-
-        return noisy_mag_log, clean_mag_log, noisy_phase
+        # Linear magnitudes: the mask is only meaningful multiplied onto linear
+        # magnitude, so log-compression happens downstream (see train.py /
+        # inference.py), not here.
+        return noisy_mag, clean_mag, noisy_phase
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
@@ -116,7 +115,7 @@ if __name__ == "__main__":
 
     loader = DataLoader(ds, batch_size=4, shuffle=True)
     noisy_mag, clean_mag, noisy_phase = next(iter(loader))
-    print("noisy_mag  shape:", noisy_mag.shape)   # (B, F, T)
+    print("noisy_mag  shape:", noisy_mag.shape)   # (B, F, T), linear magnitude
     print("clean_mag  shape:", clean_mag.shape)
     print("noisy_phase shape:", noisy_phase.shape)
     assert noisy_mag.shape == clean_mag.shape, "noisy/clean mag shapes must match!"
