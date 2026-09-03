@@ -4,7 +4,7 @@ A deep learning based speech enhancement system that removes background noise fr
 recordings, combining classical Digital Signal Processing (STFT/ISTFT, spectral masking) with
 a neural network (U-Net style) trained on the VoiceBank+DEMAND dataset.
 
-> See `theory.md` for the full conceptual/mathematical explanation of every step.
+> See `Theory.md` for the full conceptual/mathematical explanation of every step.
 
 ---
 
@@ -19,6 +19,10 @@ Noisy waveform → STFT → Magnitude + Phase split → Neural Network (predicts
 → Mask x Noisy Magnitude → Combine with noisy Phase → ISTFT → Enhanced waveform
 ```
 
+Phase is never modified (noisy-phase reconstruction) — a deliberate simplification, not an
+oversight. See §5.0 for the one convention that trips this pipeline up if you're not careful:
+the mask is only meaningful multiplied onto **linear** magnitude.
+
 ---
 
 ## 2. Dataset
@@ -26,16 +30,28 @@ Noisy waveform → STFT → Magnitude + Phase split → Neural Network (predicts
 **VoiceBank+DEMAND** — standard benchmark dataset for speech enhancement.
 - Clean speech: VCTK corpus recordings
 - Noise: DEMAND dataset (10 real-world noise types) mixed at multiple SNR levels
-- Already provided as paired (noisy, clean) `.wav` files, split into train/test
+- Already provided as paired (noisy, clean) `.wav` files, split into train/test (28-speaker
+  version — see `dataset_setup.md`)
 
-Download link and directory structure expected:
+Expected directory structure after download+extraction:
 ```
 data/raw/
-├── clean_trainset_wav/
-├── noisy_trainset_wav/
-├── clean_testset_wav/
-└── noisy_testset_wav/
+├── clean_trainset_28spk_wav/   (11,572 files)
+├── noisy_trainset_28spk_wav/   (11,572 files)
+├── clean_testset_wav/          (824 files)
+└── noisy_testset_wav/          (824 files)
 ```
+
+**Known extraction gotcha:** the official zips for `clean_trainset_28spk_wav` and
+`noisy_testset_wav` extract one level too deep on some tools (e.g.
+`clean_trainset_28spk_wav/clean_trainset_28spk_wav/*.wav`). If `NoisyCleanDataset` reports 0
+matched pairs, check for this and flatten the nested directory. `01_dataset_audit.ipynb`
+detects and auto-resolves this when auditing; `verify_data.py` and `data_loader.py` do not, so
+fix the directory structure on disk first.
+
+See `dataset_setup.md` for the full download procedure (`download_data.sh` automates it),
+`verify_data.py` for a quick file-count/pairing check, and `01_dataset_audit.ipynb` for a
+deeper per-file audit (corruption, silence, clipping, exact duplicates via hash).
 
 ---
 
@@ -45,28 +61,34 @@ data/raw/
 speech-enhancement/
 │
 ├── data/
-│   ├── raw/                # original VoiceBank+DEMAND files
-│   └── processed/          # precomputed STFT features (cached .npy/.pt files)
+│   ├── raw/                     # original VoiceBank+DEMAND files (gitignored)
+│   └── processed/               # reserved for cached STFT features — not used yet;
+│                                 # the loader recomputes STFT on every __getitem__
 │
 ├── src/
-│   ├── dsp.py               # STFT/ISTFT, feature extraction utilities
-│   ├── data_loader.py       # PyTorch Dataset + DataLoader
-│   ├── model.py             # U-Net architecture
-│   ├── losses.py            # loss functions (MSE, log-MSE, SI-SDR)
-│   ├── train.py              # training loop
-│   ├── evaluate.py           # PESQ / STOI / SI-SDR computation
-│   ├── baseline.py            # classical spectral subtraction / Wiener filter baseline
-│   └── inference.py           # run trained model on a new noisy file
+│   ├── dsp.py                   # STFT/ISTFT, magnitude/phase split, mono loading
+│   ├── data_loader.py           # NoisyCleanDataset (fixed-length crop/pad + STFT)
+│   ├── model.py                 # UNetSE — predicts a [0,1] T-F mask
+│   ├── losses.py                # log_magnitude_loss, si_sdr_loss, combined_loss
+│   ├── train.py                 # training loop, config-driven, best-checkpoint saving
+│   ├── evaluate.py              # PESQ / STOI / SI-SDR test-set driver
+│   ├── baseline.py              # classical spectral subtraction
+│   └── inference.py             # run a trained checkpoint on one file
 │
-├── notebooks/
-│   └── exploration.ipynb     # visualize spectrograms, sanity-check STFT/ISTFT
+├── 01_dataset_audit.ipynb       # per-file dataset audit (see §2)
+├── verify_data.py               # quick file-count/pairing check
+├── download_data.sh             # automated dataset download
+├── dataset_setup.md             # manual dataset download/verification guide
 │
 ├── demo/
-│   └── app.py                 # Streamlit/Gradio demo app
+│   └── app.py                   # Streamlit demo: upload noisy wav → hear enhanced result
 │
-├── checkpoints/                # saved model weights (.pt files)
+├── checkpoints/                 # saved model weights (.pt) — gitignored, empty until trained
+├── results/                     # per-mode evaluation CSVs from src/evaluate.py — tracked
 ├── configs/
-│   └── config.yaml             # hyperparameters and paths
+│   └── config.yaml              # data paths + training hyperparameters (read by train.py,
+│                                 # evaluate.py, inference.py)
+├── Theory.md                    # conceptual/mathematical background
 ├── requirements.txt
 └── README.md
 ```
@@ -90,22 +112,47 @@ torchaudio
 librosa
 numpy
 scipy
+soundfile
 pesq
 pystoi
 matplotlib
-streamlit
-soundfile
-pyyaml
+pandas
 tqdm
+pyyaml
+streamlit
 ```
+
+**Windows note:** the console's default cp1252 encoding can't print the ✅/❌ used in this
+project's smoke tests, which otherwise crashes on an encode error *after* printing the real
+result. Set `PYTHONIOENCODING=utf-8` before running any `python -m src.*` command to avoid it.
 
 ---
 
 ## 5. Core Code
 
+### 5.0 Mask-domain convention (read this before touching train.py or inference.py)
+
+The predicted mask is a `[0, 1]` multiplicative mask, and **it is only meaningful applied to
+linear magnitude** — multiplying a mask against a log-compressed magnitude doesn't correspond
+to anything physical. The convention followed consistently across this codebase is:
+
+1. `NoisyCleanDataset` returns **linear** magnitudes (`noisy_mag`, `clean_mag`).
+2. The network's *input* is log-compressed (`torch.log1p(noisy_mag)`) purely to tame dynamic
+   range — this is the only place `log1p` is applied before the mask.
+3. The predicted mask multiplies the **linear** `noisy_mag`: `pred_mag = mask * noisy_mag`.
+4. Any loss/metric that expects log-scale (`log_magnitude_loss`) is computed as
+   `log1p(pred_mag)` vs. `log1p(clean_mag)`, computed *after* masking, never before.
+
+`train.py`, `inference.py`, and `evaluate.py` all follow this. If you add a new code path that
+touches the mask, follow it too — an earlier version of `train.py` masked the log-magnitude
+directly, which trained a model whose checkpoint meant something different than what
+`inference.py` assumed.
+
 ### 5.1 `src/dsp.py` — STFT / ISTFT utilities
 
 ```python
+import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 
@@ -114,149 +161,168 @@ N_FFT = 512          # ~32ms window at 16kHz
 HOP_LENGTH = 128      # ~8ms hop (75% overlap)
 WIN_LENGTH = 512
 
-window = torch.hann_window(WIN_LENGTH)
+_window = torch.hann_window(WIN_LENGTH)
 
 def load_audio(path, sr=SAMPLE_RATE):
-    wav, orig_sr = torchaudio.load(path)
+    """Load via soundfile (not torchaudio.load — see docstring in dsp.py for why),
+    collapse to mono, resample to `sr` if needed."""
+    data, orig_sr = sf.read(str(path), dtype="float32", always_2d=True)
+    wav = torch.from_numpy(data.T)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
     if orig_sr != sr:
         wav = torchaudio.functional.resample(wav, orig_sr, sr)
-    return wav.squeeze(0)  # mono
+    return wav.squeeze(0)
 
-def stft(wav):
-    return torch.stft(
-        wav, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
-        window=window, return_complex=True
-    )
+def stft(wav, device=None):
+    window = _window.to(device) if device is not None else _window
+    if device is not None:
+        wav = wav.to(device)
+    return torch.stft(wav, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
+                       window=window, return_complex=True)
 
 def istft(spec, length=None):
-    return torch.istft(
-        spec, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
-        window=window, length=length
-    )
+    window = _window.to(spec.real.device)
+    return torch.istft(spec, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
+                        window=window, length=length)
 
 def magnitude_phase(spec):
-    mag = torch.abs(spec)
-    phase = torch.angle(spec)
-    return mag, phase
+    return torch.abs(spec), torch.angle(spec)
 
 def reconstruct_complex(mag, phase):
     return mag * torch.exp(1j * phase)
 ```
 
-**Sanity check (always do this first):** load a clean wav → STFT → ISTFT → confirm the
-reconstructed audio is (near) identical to the original. If this fails, everything downstream
-will be wrong.
-
-```python
-wav = load_audio("sample_clean.wav")
-spec = stft(wav)
-recon = istft(spec, length=wav.shape[-1])
-print(torch.allclose(wav, recon, atol=1e-4))   # should be True
+**Sanity check (verified — do this first on a new machine):**
+```bash
+python -m src.dsp
+# ✅ STFT -> ISTFT reconstruction is lossless. Safe to proceed.
 ```
+Confirmed: max abs error ≈ 1.79e-07 on a synthetic signal, well under the `atol=1e-4` threshold.
 
 ---
 
 ### 5.2 `src/data_loader.py` — Dataset class
 
 ```python
-import os
+import os, random
 import torch
 from torch.utils.data import Dataset
-from src.dsp import load_audio, stft, magnitude_phase
+from src.dsp import load_audio, stft, magnitude_phase, SAMPLE_RATE
 
 class NoisyCleanDataset(Dataset):
-    def __init__(self, noisy_dir, clean_dir):
-        self.noisy_files = sorted(os.listdir(noisy_dir))
-        self.noisy_dir = noisy_dir
-        self.clean_dir = clean_dir
+    """Crops/pads each waveform to a FIXED number of samples *before* the STFT,
+    so every item has identical tensor shape and the default DataLoader
+    collate_fn works with no custom collation needed."""
+
+    def __init__(self, noisy_dir, clean_dir, segment_seconds=2.0, train=True):
+        self.train = train
+        self.segment_len = int(segment_seconds * SAMPLE_RATE)
+        noisy_files = set(os.listdir(noisy_dir))
+        clean_files = set(os.listdir(clean_dir))
+        self.files = sorted(noisy_files & clean_files)
+        self.noisy_dir, self.clean_dir = noisy_dir, clean_dir
 
     def __len__(self):
-        return len(self.noisy_files)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        fname = self.noisy_files[idx]
+        fname = self.files[idx]
         noisy_wav = load_audio(os.path.join(self.noisy_dir, fname))
         clean_wav = load_audio(os.path.join(self.clean_dir, fname))
 
         min_len = min(noisy_wav.shape[-1], clean_wav.shape[-1])
         noisy_wav, clean_wav = noisy_wav[:min_len], clean_wav[:min_len]
 
-        noisy_spec = stft(noisy_wav)
-        clean_spec = stft(clean_wav)
+        # One shared random crop offset for both, so the same time window
+        # is used for noisy and clean.
+        n = noisy_wav.shape[-1]
+        if n > self.segment_len:
+            start = random.randint(0, n - self.segment_len) if self.train else 0
+            noisy_wav = noisy_wav[start:start + self.segment_len]
+            clean_wav = clean_wav[start:start + self.segment_len]
+        elif n < self.segment_len:
+            pad = self.segment_len - n
+            noisy_wav = torch.nn.functional.pad(noisy_wav, (0, pad))
+            clean_wav = torch.nn.functional.pad(clean_wav, (0, pad))
 
+        noisy_spec, clean_spec = stft(noisy_wav), stft(clean_wav)
         noisy_mag, noisy_phase = magnitude_phase(noisy_spec)
         clean_mag, _ = magnitude_phase(clean_spec)
 
-        # log-magnitude, commonly used to compress dynamic range
-        noisy_mag_log = torch.log1p(noisy_mag)
-        clean_mag_log = torch.log1p(clean_mag)
-
-        return noisy_mag_log, clean_mag_log, noisy_phase
+        # LINEAR magnitudes — see §5.0. Log-compression happens downstream.
+        return noisy_mag, clean_mag, noisy_phase
 ```
+
+Verified against the real (post-flatten) dataset: `Dataset size: 11572 pairs`, batches of
+shape `(4, 257, 251)` for a 2-second segment, default `DataLoader` collation works with no
+custom `collate_fn`.
 
 ---
 
 ### 5.3 `src/model.py` — U-Net for mask prediction
 
 ```python
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 
 def conv_block(in_ch, out_ch):
     return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, 3, padding=1),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, 3, padding=1),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
+        nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
     )
 
+def _match_size(x, target):
+    """Center-crop or pad x (B,C,H,W) so its spatial dims match target's —
+    N_FFT=512 gives 257 freq bins, which isn't divisible by 8 (three 2x
+    poolings), so skip connections need this to line up."""
+    _, _, h, w = x.shape
+    _, _, th, tw = target.shape
+    if h != th or w != tw:
+        dh, dw = th - h, tw - w
+        x = F.pad(x, (0, max(dw, 0), 0, max(dh, 0)))
+        if dh < 0 or dw < 0:
+            x = x[:, :, :th, :tw]
+    return x
+
 class UNetSE(nn.Module):
-    """U-Net that predicts a Time-Frequency mask (values 0-1) applied to noisy magnitude."""
+    """Predicts a [0,1] T-F mask, applied to LINEAR noisy magnitude (§5.0)."""
     def __init__(self, base_ch=32):
         super().__init__()
         self.enc1 = conv_block(1, base_ch)
         self.enc2 = conv_block(base_ch, base_ch * 2)
         self.enc3 = conv_block(base_ch * 2, base_ch * 4)
         self.pool = nn.MaxPool2d(2)
-
         self.bottleneck = conv_block(base_ch * 4, base_ch * 8)
-
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
         self.dec3 = conv_block(base_ch * 8, base_ch * 4)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
         self.dec2 = conv_block(base_ch * 4, base_ch * 2)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
         self.dec1 = conv_block(base_ch * 2, base_ch)
-
         self.out_conv = nn.Conv2d(base_ch, 1, 1)
 
-    def forward(self, x):
-        # x: (batch, 1, freq, time)
+    def forward(self, x):  # x: (batch, 1, freq, time)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         b = self.bottleneck(self.pool(e3))
 
-        d3 = self.up3(b)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
-        d2 = self.up2(d3)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        mask = torch.sigmoid(self.out_conv(d1))  # values in [0,1]
-        return mask
+        d3 = self.dec3(torch.cat([_match_size(self.up3(b), e3), e3], dim=1))
+        d2 = self.dec2(torch.cat([_match_size(self.up2(d3), e2), e2], dim=1))
+        d1 = self.dec1(torch.cat([_match_size(self.up1(d2), e1), e1], dim=1))
+        d1 = _match_size(d1, x)
+        return torch.sigmoid(self.out_conv(d1))
 ```
+
+`base_ch=32` → 1,927,841 parameters. Verified: forward pass on `(2, 1, 257, 126)` produces a
+matching `(2, 1, 257, 126)` mask in `[0, 1]`.
 
 ---
 
 ### 5.4 `src/losses.py` — Loss functions
 
 ```python
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn
 
 mse_loss = nn.MSELoss()
 
@@ -264,193 +330,238 @@ def log_magnitude_loss(pred_log_mag, target_log_mag):
     return mse_loss(pred_log_mag, target_log_mag)
 
 def si_sdr_loss(pred_wav, target_wav, eps=1e-8):
-    """Scale-Invariant SDR loss (negative, since we minimize)."""
+    """Negative SI-SDR (time-domain), so minimizing it maximizes SI-SDR."""
     pred_wav = pred_wav - pred_wav.mean(dim=-1, keepdim=True)
     target_wav = target_wav - target_wav.mean(dim=-1, keepdim=True)
-
-    s_target = (torch.sum(pred_wav * target_wav, dim=-1, keepdim=True) /
-                (torch.sum(target_wav ** 2, dim=-1, keepdim=True) + eps)) * target_wav
+    dot = torch.sum(pred_wav * target_wav, dim=-1, keepdim=True)
+    target_energy = torch.sum(target_wav ** 2, dim=-1, keepdim=True) + eps
+    s_target = (dot / target_energy) * target_wav
     e_noise = pred_wav - s_target
-
-    si_sdr = 10 * torch.log10(
-        (torch.sum(s_target ** 2, dim=-1) + eps) /
-        (torch.sum(e_noise ** 2, dim=-1) + eps)
-    )
+    si_sdr = 10 * torch.log10((torch.sum(s_target ** 2, dim=-1) + eps) /
+                               (torch.sum(e_noise ** 2, dim=-1) + eps))
     return -si_sdr.mean()
+
+def combined_loss(pred_log_mag, target_log_mag, pred_wav=None, target_wav=None, si_sdr_weight=0.0):
+    """log-mag loss, optionally blended with SI-SDR loss (needs waveforms — see
+    roadmap item 6, not wired into train.py's loop yet)."""
+    loss = log_magnitude_loss(pred_log_mag, target_log_mag)
+    if si_sdr_weight > 0:
+        if pred_wav is None or target_wav is None:
+            raise ValueError("si_sdr_weight > 0 requires pred_wav and target_wav")
+        loss = loss + si_sdr_weight * si_sdr_loss(pred_wav, target_wav)
+    return loss
 ```
+
+`src/evaluate.py`'s `si_sdr()` metric reuses `si_sdr_loss` (sign-flipped), rather than
+reimplementing the same math twice.
 
 ---
 
-### 5.5 `src/train.py` — Training loop (skeleton)
+### 5.5 `src/train.py` — Training loop
 
 ```python
-import torch
+import os, torch, yaml
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from src.data_loader import NoisyCleanDataset
 from src.model import UNetSE
-from src.losses import log_magnitude_loss
+from src.losses import combined_loss
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-train_dataset = NoisyCleanDataset("data/raw/noisy_trainset_wav", "data/raw/clean_trainset_wav")
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=None)
-
-model = UNetSE().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-EPOCHS = 30
-
-for epoch in range(EPOCHS):
-    model.train()
+def run_epoch(model, loader, optimizer, device, si_sdr_weight, train=True):
+    model.train() if train else model.eval()
     running_loss = 0.0
+    with torch.set_grad_enabled(train):
+        for noisy_mag, clean_mag, _noisy_phase in tqdm(loader, leave=False):
+            noisy_mag = noisy_mag.unsqueeze(1).to(device)   # (B,1,F,T), linear
+            clean_mag = clean_mag.unsqueeze(1).to(device)
 
-    for noisy_mag, clean_mag, noisy_phase in train_loader:
-        noisy_mag = noisy_mag.unsqueeze(1).to(device)   # (B,1,F,T)
-        clean_mag = clean_mag.unsqueeze(1).to(device)
+            # See §5.0: log-compress only for the model's input; mask the
+            # linear magnitude; compare the loss in log domain.
+            mask = model(torch.log1p(noisy_mag))
+            pred_mag = mask * noisy_mag
+            loss = combined_loss(torch.log1p(pred_mag), torch.log1p(clean_mag),
+                                  si_sdr_weight=si_sdr_weight)
 
-        mask = model(noisy_mag)
-        pred_mag = mask * noisy_mag
+            if train:
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+            running_loss += loss.item()
+    return running_loss / max(len(loader), 1)
 
-        loss = log_magnitude_loss(pred_mag, clean_mag)
+def main():
+    cfg = yaml.safe_load(open("configs/config.yaml"))
+    data_cfg, train_cfg = cfg.get("data", {}), cfg.get("train", {})
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    train_dataset = NoisyCleanDataset(data_cfg["noisy_train_dir"], data_cfg["clean_train_dir"],
+                                       segment_seconds=train_cfg.get("segment_seconds", 2.0), train=True)
+    val_dataset = NoisyCleanDataset(data_cfg["noisy_test_dir"], data_cfg["clean_test_dir"],
+                                     segment_seconds=train_cfg.get("segment_seconds", 2.0), train=False)
 
-        running_loss += loss.item()
+    model = UNetSE(base_ch=train_cfg.get("base_ch", 32)).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 1e-3))
 
-    print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {running_loss/len(train_loader):.4f}")
+    checkpoint_path = train_cfg.get("checkpoint_path", "checkpoints/unet_se.pt")
+    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
 
-torch.save(model.state_dict(), "checkpoints/unet_se.pt")
+    best_val_loss = float("inf")
+    for epoch in range(train_cfg.get("epochs", 30)):
+        train_loss = run_epoch(model, train_loader, optimizer, device, 0.0, train=True)
+        val_loss = run_epoch(model, val_loader, optimizer, device, 0.0, train=False)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), checkpoint_path)  # only the best epoch, not the last
 ```
 
-> Note: real audio clips have variable length — in practice you'll want to chunk/pad
-> spectrograms to a fixed number of time frames per batch (see `theory.md` §7 for details).
+(Full version reads all hyperparameters from `configs/config.yaml`, builds both loaders, and
+logs per-epoch — see `src/train.py`.) Only saves `checkpoints/unet_se.pt` when validation loss
+improves, so the checkpoint is always the best epoch seen, not just the last one.
+
+**Verified:** a manual 60-step overfit on 8 real training clips drops loss from 0.0235 to
+0.0032 — the plumbing (data → model → mask → loss → backward) works end to end. A full
+training run over all 11,572 pairs has not been done yet; `checkpoints/` is currently empty.
 
 ---
 
-### 5.6 `src/evaluate.py` — PESQ / STOI / SI-SDR evaluation
+### 5.6 `src/evaluate.py` — PESQ / STOI / SI-SDR test-set evaluation
 
 ```python
-from pesq import pesq
-from pystoi import stoi
-import numpy as np
+def si_sdr(pred_wav, target_wav, eps=1e-8):
+    """SI-SDR metric (higher is better) — reuses losses.si_sdr_loss, sign-flipped."""
+    return -si_sdr_loss(pred_wav, target_wav, eps=eps).item()
 
-def evaluate_pair(clean_wav, enhanced_wav, sr=16000):
-    clean_np = clean_wav.numpy()
-    enhanced_np = enhanced_wav.numpy()
+def evaluate_pair(clean_wav, enhanced_wav, sr=SAMPLE_RATE):
+    """PESQ (wideband) / STOI / SI-SDR for one pair. Truncates to equal length
+    first; PESQ is wrapped in try/except since it raises on near-silent clips
+    rather than returning a score."""
+    min_len = min(clean_wav.shape[-1], enhanced_wav.shape[-1])
+    clean_wav, enhanced_wav = clean_wav[:min_len], enhanced_wav[:min_len]
+    try:
+        pesq_score, pesq_failed = pesq(sr, clean_wav.numpy(), enhanced_wav.numpy(), "wb"), False
+    except Exception:
+        pesq_score, pesq_failed = None, True
+    stoi_score = stoi(clean_wav.numpy(), enhanced_wav.numpy(), sr, extended=False)
+    return {"PESQ": pesq_score, "STOI": stoi_score,
+            "SI-SDR": si_sdr(enhanced_wav, clean_wav), "pesq_failed": pesq_failed}
 
-    pesq_score = pesq(sr, clean_np, enhanced_np, 'wb')   # wideband PESQ
-    stoi_score = stoi(clean_np, enhanced_np, sr, extended=False)
-
-    return {"PESQ": pesq_score, "STOI": stoi_score}
+def run_evaluation(enhance_fn, name, data_cfg, limit=None):
+    """Walks the matched test-set files, applies enhance_fn per clip, writes
+    results/<name>_metrics.csv plus a printed summary. enhance_fn is identity
+    for the noisy floor, spectral_subtraction for the baseline, or a loaded
+    checkpoint's forward pass for the model."""
+    ...
 ```
+
+CLI (full test set, one mode at a time):
+```bash
+python -m src.evaluate --mode noisy                                    # unprocessed floor
+python -m src.evaluate --mode baseline                                 # spectral subtraction
+python -m src.evaluate --mode model --checkpoint checkpoints/unet_se.pt
+python -m src.evaluate --mode noisy --limit 20                         # quick smoke run
+```
+
+See §6 for the noisy/baseline numbers currently recorded in `results/`.
 
 ---
 
-### 5.7 `src/baseline.py` — Classical baseline (Spectral Subtraction)
+### 5.7 `src/baseline.py` — Classical baseline (spectral subtraction)
 
 ```python
 import torch
 from src.dsp import stft, istft, magnitude_phase, reconstruct_complex
 
 def spectral_subtraction(noisy_wav, noise_estimate_frames=6, alpha=2.0, beta=0.01):
-    """Simple spectral subtraction baseline for comparison against the AI model."""
+    """Estimates the noise spectrum from the first few frames (assumed
+    noise-only — real VoiceBank+DEMAND clips have a short silent lead-in)
+    and subtracts it from every frame, with a spectral floor to limit
+    musical-noise artifacts from over-subtraction."""
     spec = stft(noisy_wav)
     mag, phase = magnitude_phase(spec)
-
-    # estimate noise spectrum from the first few frames (assumed noise-only)
-    noise_mag = mag[:, :noise_estimate_frames].mean(dim=1, keepdim=True)
-
-    enhanced_mag = mag - alpha * noise_mag
-    enhanced_mag = torch.clamp(enhanced_mag, min=beta * mag)  # spectral floor
-
-    enhanced_spec = reconstruct_complex(enhanced_mag, phase)
-    return istft(enhanced_spec, length=noisy_wav.shape[-1])
+    n_estimate = min(noise_estimate_frames, mag.shape[-1])
+    noise_mag = mag[..., :n_estimate].mean(dim=-1, keepdim=True)
+    enhanced_mag = torch.clamp(mag - alpha * noise_mag, min=beta * mag)
+    return istft(reconstruct_complex(enhanced_mag, phase), length=noisy_wav.shape[-1])
 ```
+
+**Verified on real data:** RMSE vs. clean drops from 0.0152 to 0.0064 on a real test-set pair
+(58% reduction). Its noise estimate assumes a silent lead-in, which real VoiceBank clips have
+but is worth keeping in mind if you ever point it at audio that doesn't (a naive per-file VAD
+or minimum-statistics estimate would be more robust, but wasn't necessary here).
 
 ---
 
 ### 5.8 `src/inference.py` — Run enhancement on a new file
 
 ```python
-import torch
-import torchaudio
-from src.dsp import load_audio, stft, istft, magnitude_phase, reconstruct_complex
-from src.model import UNetSE
+def enhance_file(input_path, output_path, checkpoint=None, base_ch=None, device=None):
+    ...
+    wav = load_audio(input_path).to(device)
+    mag, phase = magnitude_phase(stft(wav))
+    mask = model(torch.log1p(mag).unsqueeze(0).unsqueeze(0)).squeeze()
 
-def enhance_file(input_path, output_path, checkpoint="checkpoints/unet_se.pt"):
-    model = UNetSE()
-    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
-    model.eval()
-
-    wav = load_audio(input_path)
-    spec = stft(wav)
-    mag, phase = magnitude_phase(spec)
-    mag_log = torch.log1p(mag).unsqueeze(0).unsqueeze(0)
-
-    with torch.no_grad():
-        mask = model(mag_log).squeeze()
-
-    enhanced_mag = mask * mag
+    enhanced_mag = mask * mag                              # linear magnitude — see §5.0
     enhanced_spec = reconstruct_complex(enhanced_mag, phase)
-    enhanced_wav = istft(enhanced_spec, length=wav.shape[-1])
+    enhanced_wav = istft(enhanced_spec, length=wav.shape[-1]).cpu()
+    torchaudio.save(output_path, enhanced_wav.unsqueeze(0), SAMPLE_RATE)
+```
 
-    torchaudio.save(output_path, enhanced_wav.unsqueeze(0), 16000)
+```bash
+python -m src.inference --input noisy.wav --output enhanced.wav
+python -m src.inference --input noisy.wav --output enhanced.wav --checkpoint checkpoints/unet_se.pt
 ```
 
 ---
 
-### 5.9 `demo/app.py` — Streamlit demo (skeleton)
+### 5.9 `demo/app.py` — Streamlit demo
 
-```python
-import streamlit as st
-import tempfile
-from src.inference import enhance_file
+Uploads a noisy `.wav`, calls `enhance_file`, and plays both the input and output with a
+download button for the result. Not yet tested end-to-end — it requires a trained checkpoint
+at `checkpoints/unet_se.pt`, which doesn't exist yet (§5.5).
 
-st.title("AI Speech Enhancement Demo")
-
-uploaded_file = st.file_uploader("Upload a noisy audio file (.wav)", type=["wav"])
-
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp_in:
-        tmp_in.write(uploaded_file.read())
-        tmp_in.flush()
-
-        st.subheader("Noisy Input")
-        st.audio(tmp_in.name)
-
-        output_path = "enhanced_output.wav"
-        enhance_file(tmp_in.name, output_path)
-
-        st.subheader("Enhanced Output")
-        st.audio(output_path)
-```
-
-Run with:
 ```bash
 streamlit run demo/app.py
 ```
 
 ---
 
-## 6. Roadmap / Milestones
+## 6. Current results
 
-1. [ ] Verify STFT → ISTFT reconstruction is lossless
-2. [ ] Implement and test classical baseline (spectral subtraction)
-3. [ ] Build data pipeline + sanity check on a few samples
-4. [ ] Train U-Net mask model, confirm loss decreases
-5. [ ] Evaluate with PESQ / STOI / SI-SDR, compare to baseline
+Recorded in `results/` via `python -m src.evaluate --mode <noisy|baseline>` on the full
+824-file test set (0 PESQ skips in either run):
+
+| Mode | PESQ | STOI | SI-SDR (dB) |
+|---|---|---|---|
+| noisy (unprocessed floor) | 1.971 | 0.921 | 8.44 |
+| baseline (spectral subtraction) | 2.320 | 0.914 | 15.09 |
+| U-Net (log-mag loss) | not yet — no trained checkpoint | | |
+| U-Net (SI-SDR loss) | not started | | |
+
+The baseline clearly beats the noisy floor on PESQ and SI-SDR (as expected — that's the point
+of comparing against it), but very slightly *underperforms* on STOI (0.914 vs 0.921):
+spectral subtraction's musical-noise artifacts can cost a little intelligibility even while
+improving perceived quality and SNR. Worth keeping in mind when the U-Net numbers land —
+beating baseline PESQ/SI-SDR is the easy bar; beating it on STOI too is the more interesting one.
+
+---
+
+## 7. Roadmap / Milestones
+
+1. [x] Verify STFT → ISTFT reconstruction is lossless — confirmed, max abs error ≈ 1.79e-07
+2. [x] Implement and test classical baseline (spectral subtraction) — 58% RMSE reduction on real data
+3. [x] Build data pipeline + sanity check on a few samples — 11,572/824 pairs load and batch correctly
+4. [x] Train U-Net mask model, confirm loss decreases — confirmed via manual overfit (0.0235→0.0032);
+   a full training run over the whole training set has not been done yet
+5. [~] Evaluate with PESQ / STOI / SI-SDR, compare to baseline — driver built, noisy floor and
+   baseline scored on the full test set; model scoring blocked on a trained checkpoint
 6. [ ] Tune loss function (try log-mag loss vs SI-SDR loss)
-7. [ ] Build Streamlit demo
+7. [ ] Build Streamlit demo — skeleton wired to `inference.py`, untested (needs a checkpoint)
 8. [ ] (Stretch) Implement Conv-TasNet and compare time-domain vs T-F domain approaches
 9. [ ] Write up final report with metric tables + before/after spectrogram plots
 
 ---
 
-## 7. References
+## 8. References
 
 - Pascual et al., "SEGAN: Speech Enhancement Generative Adversarial Network"
 - Luo & Mesgarani, "Conv-TasNet: Surpassing Ideal Time-Frequency Magnitude Masking for Speech Separation"
 - Valentini-Botinhao et al., "Noisy speech database for training speech enhancement algorithms" (VoiceBank+DEMAND)
-- See `theory.md` for full conceptual background.
+- See `Theory.md` for full conceptual background.
