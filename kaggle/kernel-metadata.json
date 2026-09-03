@@ -1,0 +1,13 @@
+{
+  "id": "devvashist/noiseenhancer-train",
+  "title": "NoiseEnhancer Train",
+  "code_file": "kaggle_train.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["jiangwq666/voicebank-demand"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
