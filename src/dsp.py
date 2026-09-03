@@ -52,9 +52,9 @@ def load_audio(path, sr=SAMPLE_RATE):
 
 def stft(wav, device=None):
     """Waveform (T,) -> complex spectrogram (F, T')."""
-    window = _window.to(device) if device is not None else _window
     if device is not None:
         wav = wav.to(device)
+    window = _window.to(wav.device)
     return torch.stft(
         wav, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
         window=window, return_complex=True
@@ -63,7 +63,7 @@ def stft(wav, device=None):
 
 def istft(spec, length=None):
     """Complex spectrogram (F, T') -> waveform (T,). `length` trims padding."""
-    window = _window.to(spec.real.device)
+    window = _window.to(spec.device)
     return torch.istft(
         spec, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
         window=window, length=length
