@@ -525,21 +525,21 @@ streamlit run demo/app.py
 
 ## 6. Current results
 
-Recorded in `results/` via `python -m src.evaluate --mode <noisy|baseline>` on the full
-824-file test set (0 PESQ skips in either run):
+Recorded in `results/` via `python -m src.evaluate --mode <noisy|baseline|model>` on the full
+824-file test set (0 PESQ skips in any run):
 
 | Mode | PESQ | STOI | SI-SDR (dB) |
 |---|---|---|---|
 | noisy (unprocessed floor) | 1.971 | 0.921 | 8.44 |
-| baseline (spectral subtraction) | 2.320 | 0.914 | 15.09 |
-| U-Net (log-mag loss) | not yet — no trained checkpoint | | |
+| baseline (spectral subtraction, alpha=1.5) | 2.323 | 0.917 | 14.615 |
+| U-Net (log-mag loss, 30 epochs) | **2.746** | **0.941** | **18.162** |
 | U-Net (SI-SDR loss) | not started | | |
 
-The baseline clearly beats the noisy floor on PESQ and SI-SDR (as expected — that's the point
-of comparing against it), but very slightly *underperforms* on STOI (0.914 vs 0.921):
-spectral subtraction's musical-noise artifacts can cost a little intelligibility even while
-improving perceived quality and SNR. Worth keeping in mind when the U-Net numbers land —
-beating baseline PESQ/SI-SDR is the easy bar; beating it on STOI too is the more interesting one.
+The U-Net (trained on a Kaggle T4, 2.42h wall-clock, best val_loss 0.00198 at epoch 18 —
+see `results/train_log.csv` and `results/training_curve.png`) beats the baseline on every
+metric, including STOI, which the baseline alone couldn't do relative to the noisy floor:
+spectral subtraction's musical-noise artifacts cost a little intelligibility even while
+improving perceived quality and SNR, but the learned mask recovers past that.
 
 ---
 
@@ -548,10 +548,10 @@ beating baseline PESQ/SI-SDR is the easy bar; beating it on STOI too is the more
 1. [x] Verify STFT → ISTFT reconstruction is lossless — confirmed, max abs error ≈ 1.79e-07
 2. [x] Implement and test classical baseline (spectral subtraction) — 58% RMSE reduction on real data
 3. [x] Build data pipeline + sanity check on a few samples — 11,572/824 pairs load and batch correctly
-4. [x] Train U-Net mask model, confirm loss decreases — confirmed via manual overfit (0.0235→0.0032);
-   a full training run over the whole training set has not been done yet
-5. [~] Evaluate with PESQ / STOI / SI-SDR, compare to baseline — driver built, noisy floor and
-   baseline scored on the full test set; model scoring blocked on a trained checkpoint
+4. [x] Train U-Net mask model, confirm loss decreases — full 30-epoch run on a Kaggle T4
+   (2.42h), best val_loss 0.00198 at epoch 18, checkpoint saved
+5. [x] Evaluate with PESQ / STOI / SI-SDR, compare to baseline — all three modes (noisy,
+   baseline, model) scored on the full test set; U-Net beats baseline on every metric
 6. [ ] Tune loss function (try log-mag loss vs SI-SDR loss)
 7. [ ] Build Streamlit demo — skeleton wired to `inference.py`, untested (needs a checkpoint)
 8. [ ] (Stretch) Implement Conv-TasNet and compare time-domain vs T-F domain approaches
