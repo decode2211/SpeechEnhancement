@@ -9,8 +9,8 @@ Usage:
 import argparse
 import os
 
+import soundfile as sf
 import torch
-import torchaudio
 import yaml
 
 from src.dsp import load_audio, stft, istft, magnitude_phase, reconstruct_complex, SAMPLE_RATE
@@ -39,7 +39,7 @@ def enhance_file(input_path, output_path, checkpoint=None, base_ch=None, device=
         )
 
     model = UNetSE(base_ch=base_ch).to(device)
-    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     model.eval()
 
     wav = load_audio(input_path).to(device)
@@ -55,7 +55,9 @@ def enhance_file(input_path, output_path, checkpoint=None, base_ch=None, device=
     enhanced_wav = istft(enhanced_spec, length=wav.shape[-1]).cpu()
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    torchaudio.save(output_path, enhanced_wav.unsqueeze(0), SAMPLE_RATE)
+    # soundfile, not torchaudio.save() — same torchcodec-backend issue as
+    # load_audio() in dsp.py works around, but on the write side.
+    sf.write(output_path, enhanced_wav.numpy(), SAMPLE_RATE)
     print(f"[inference] wrote enhanced audio to {output_path}")
     return output_path
 
