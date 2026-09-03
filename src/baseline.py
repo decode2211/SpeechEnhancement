@@ -49,6 +49,11 @@ if __name__ == "__main__":
     sr = 16000
     t = torch.linspace(0, 2, sr * 2)
     clean = 0.5 * torch.sin(2 * torch.pi * 220 * t)
+    # Zero out a short lead-in so the first few frames are noise-only, matching
+    # the assumption spectral_subtraction's noise estimate depends on (real
+    # VoiceBank+DEMAND clips have this silence naturally; a continuous tone
+    # does not, which would make this self-test invalid).
+    clean[: sr // 4] = 0.0
     noise = 0.3 * torch.randn_like(clean)
     noisy = clean + noise
 
