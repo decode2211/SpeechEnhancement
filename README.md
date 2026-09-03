@@ -67,13 +67,14 @@ speech-enhancement/
 │
 ├── src/
 │   ├── dsp.py                   # STFT/ISTFT, magnitude/phase split, mono loading
-│   ├── data_loader.py           # NoisyCleanDataset (fixed-length crop/pad + STFT)
+│   ├── data_loader.py           # NoisyCleanDataset + speaker-disjoint val split
 │   ├── model.py                 # UNetSE — predicts a [0,1] T-F mask
 │   ├── losses.py                # log_magnitude_loss, si_sdr_loss, combined_loss
 │   ├── train.py                 # training loop, config-driven, best-checkpoint saving
 │   ├── evaluate.py              # PESQ / STOI / SI-SDR test-set driver
 │   ├── baseline.py              # classical spectral subtraction
-│   └── inference.py             # run a trained checkpoint on one file
+│   ├── inference.py             # run a trained checkpoint on one file
+│   └── plot_training_curve.py   # train/val loss vs epoch -> results/training_curve.png
 │
 ├── 01_dataset_audit.ipynb       # per-file dataset audit (see §2)
 ├── verify_data.py               # quick file-count/pairing check
@@ -81,9 +82,13 @@ speech-enhancement/
 ├── dataset_setup.md             # manual dataset download/verification guide
 │
 ├── demo/
-│   └── app.py                   # Streamlit demo: upload noisy wav → hear enhanced result
+│   └── app.py                   # Streamlit demo: upload noisy wav → hear enhanced, spectrograms
 │
-├── checkpoints/                 # saved model weights (.pt) — gitignored, empty until trained
+├── kaggle/
+│   ├── kaggle_train.ipynb       # GPU training notebook (clone repo, resolve dataset, train, eval)
+│   └── kernel-metadata.json     # `kaggle kernels push -p kaggle/` target
+│
+├── checkpoints/                 # saved model weights (.pt) — gitignored
 ├── results/                     # per-mode evaluation CSVs from src/evaluate.py — tracked
 ├── configs/
 │   └── config.yaml              # data paths + training hyperparameters (read by train.py,
@@ -205,22 +210,45 @@ Confirmed: max abs error ≈ 1.79e-07 on a synthetic signal, well under the `ato
 ### 5.2 `src/data_loader.py` — Dataset class
 
 ```python
-import os, random
+import os, random, re
 import torch
 from torch.utils.data import Dataset
 from src.dsp import load_audio, stft, magnitude_phase, SAMPLE_RATE
+
+SPEAKER_RE = re.compile(r"^(p\d+)_")
+
+def split_train_val_speakers(noisy_dir, clean_dir, num_val_speakers=2, seed=42):
+    """Held-out validation split BY SPEAKER, not by file — utterances from the
+    same speaker are acoustically correlated, so a per-file split would leak
+    speaker identity into "validation". Deterministic given (num_val_speakers,
+    seed): sorts speakers before sampling so directory-listing order can't
+    change which ones get held out."""
+    common = sorted(set(os.listdir(noisy_dir)) & set(os.listdir(clean_dir)))
+    by_speaker = {}
+    for fname in common:
+        by_speaker.setdefault(SPEAKER_RE.match(fname).group(1), []).append(fname)
+
+    speakers = sorted(by_speaker)
+    val_speakers = sorted(random.Random(seed).sample(speakers, num_val_speakers))
+    train_files = [f for s in speakers if s not in val_speakers for f in by_speaker[s]]
+    val_files = [f for s in val_speakers for f in by_speaker[s]]
+    return sorted(train_files), sorted(val_files), val_speakers
+
 
 class NoisyCleanDataset(Dataset):
     """Crops/pads each waveform to a FIXED number of samples *before* the STFT,
     so every item has identical tensor shape and the default DataLoader
     collate_fn works with no custom collation needed."""
 
-    def __init__(self, noisy_dir, clean_dir, segment_seconds=2.0, train=True):
+    def __init__(self, noisy_dir, clean_dir, segment_seconds=2.0, train=True, file_list=None):
         self.train = train
         self.segment_len = int(segment_seconds * SAMPLE_RATE)
-        noisy_files = set(os.listdir(noisy_dir))
-        clean_files = set(os.listdir(clean_dir))
-        self.files = sorted(noisy_files & clean_files)
+        if file_list is not None:
+            self.files = sorted(file_list)   # e.g. a speaker-disjoint subset
+        else:
+            noisy_files = set(os.listdir(noisy_dir))
+            clean_files = set(os.listdir(clean_dir))
+            self.files = sorted(noisy_files & clean_files)
         self.noisy_dir, self.clean_dir = noisy_dir, clean_dir
 
     def __len__(self):
@@ -363,7 +391,7 @@ reimplementing the same math twice.
 import os, torch, yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from src.data_loader import NoisyCleanDataset
+from src.data_loader import NoisyCleanDataset, split_train_val_speakers
 from src.model import UNetSE
 from src.losses import combined_loss
 
@@ -392,10 +420,20 @@ def main():
     data_cfg, train_cfg = cfg.get("data", {}), cfg.get("train", {})
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Speaker-disjoint split carved out of the TRAINING set — never the test
+    # directories, which evaluate.py reads exclusively (§5.0-adjacent fix:
+    # reusing the test set for checkpoint selection biases reported metrics).
+    train_files, val_files, held_out = split_train_val_speakers(
+        data_cfg["noisy_train_dir"], data_cfg["clean_train_dir"],
+        num_val_speakers=train_cfg.get("val_speakers", 2),
+        seed=train_cfg.get("val_split_seed", 42),
+    )
     train_dataset = NoisyCleanDataset(data_cfg["noisy_train_dir"], data_cfg["clean_train_dir"],
-                                       segment_seconds=train_cfg.get("segment_seconds", 2.0), train=True)
-    val_dataset = NoisyCleanDataset(data_cfg["noisy_test_dir"], data_cfg["clean_test_dir"],
-                                     segment_seconds=train_cfg.get("segment_seconds", 2.0), train=False)
+                                       segment_seconds=train_cfg.get("segment_seconds", 2.0),
+                                       train=True, file_list=train_files)
+    val_dataset = NoisyCleanDataset(data_cfg["noisy_train_dir"], data_cfg["clean_train_dir"],
+                                     segment_seconds=train_cfg.get("segment_seconds", 2.0),
+                                     train=False, file_list=val_files)
 
     model = UNetSE(base_ch=train_cfg.get("base_ch", 32)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 1e-3))
@@ -417,8 +455,10 @@ logs per-epoch — see `src/train.py`.) Only saves `checkpoints/unet_se.pt` when
 improves, so the checkpoint is always the best epoch seen, not just the last one.
 
 **Verified:** a manual 60-step overfit on 8 real training clips drops loss from 0.0235 to
-0.0032 — the plumbing (data → model → mask → loss → backward) works end to end. A full
-training run over all 11,572 pairs has not been done yet; `checkpoints/` is currently empty.
+0.0032 confirmed the plumbing works end to end, and a full 30-epoch run on a Kaggle T4
+(2.42h) produced the checkpoint at `checkpoints/unet_se.pt` — see §6 for results. That run's
+validation split predates the speaker-disjoint fix shown above; see the Limitations note in
+§6 before treating its numbers as clean.
 
 ---
 
@@ -513,9 +553,9 @@ python -m src.inference --input noisy.wav --output enhanced.wav --checkpoint che
 
 ### 5.9 `demo/app.py` — Streamlit demo
 
-Uploads a noisy `.wav`, calls `enhance_file`, and plays both the input and output with a
-download button for the result. Not yet tested end-to-end — it requires a trained checkpoint
-at `checkpoints/unet_se.pt`, which doesn't exist yet (§5.5).
+Uploads a noisy `.wav`, calls `enhance_file`, plays both the input and output, shows a
+before/after spectrogram comparison (shared dB scale across both panels), and offers a
+download button for the result. Verified end-to-end against a trained checkpoint.
 
 ```bash
 streamlit run demo/app.py
@@ -566,7 +606,8 @@ above predate that fix and haven't been re-run yet.
 5. [x] Evaluate with PESQ / STOI / SI-SDR, compare to baseline — all three modes (noisy,
    baseline, model) scored on the full test set; U-Net beats baseline on every metric
 6. [ ] Tune loss function (try log-mag loss vs SI-SDR loss)
-7. [ ] Build Streamlit demo — skeleton wired to `inference.py`, untested (needs a checkpoint)
+7. [x] Build Streamlit demo — wired to a trained checkpoint, before/after spectrogram plot
+   added, verified end-to-end (upload -> both audio players -> spectrograms -> download)
 8. [ ] (Stretch) Implement Conv-TasNet and compare time-domain vs T-F domain approaches
 9. [ ] Write up final report with metric tables + before/after spectrogram plots
 
