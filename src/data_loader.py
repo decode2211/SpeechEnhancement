@@ -11,11 +11,54 @@ default DataLoader collate_fn just works.
 
 import os
 import random
+import re
 
 import torch
 from torch.utils.data import Dataset
 
 from src.dsp import load_audio, stft, magnitude_phase, SAMPLE_RATE
+
+SPEAKER_RE = re.compile(r"^(p\d+)_")
+
+
+def split_train_val_speakers(noisy_dir, clean_dir, num_val_speakers=2, seed=42):
+    """
+    Carve a held-out validation split out of a training directory pair by
+    SPEAKER, not by file — VoiceBank+DEMAND filenames are p<speaker>_<utt>.wav,
+    and utterances from the same speaker are acoustically correlated, so a
+    per-file random split would leak speaker identity into "validation."
+
+    Deterministic given the same (num_val_speakers, seed): sorts the speaker
+    IDs first (directory listing order isn't guaranteed stable across
+    filesystems) before sampling, so the same seed always holds out the same
+    speakers.
+
+    Returns (train_files, val_files, val_speakers) — plain filename lists
+    (no directory prefix), val_speakers sorted for a readable, stable record
+    of exactly what was held out.
+    """
+    noisy_files = set(os.listdir(noisy_dir))
+    clean_files = set(os.listdir(clean_dir))
+    common = sorted(noisy_files & clean_files)
+
+    by_speaker = {}
+    for fname in common:
+        m = SPEAKER_RE.match(fname)
+        if not m:
+            raise ValueError(f"Filename doesn't match expected p<speaker>_<utt>.wav pattern: {fname}")
+        by_speaker.setdefault(m.group(1), []).append(fname)
+
+    speakers = sorted(by_speaker)
+    if num_val_speakers >= len(speakers):
+        raise ValueError(f"num_val_speakers={num_val_speakers} >= {len(speakers)} total speakers")
+
+    val_speakers = sorted(random.Random(seed).sample(speakers, num_val_speakers))
+    val_speaker_set = set(val_speakers)
+
+    train_files = [f for s in speakers if s not in val_speaker_set for f in by_speaker[s]]
+    val_files = [f for s in val_speakers for f in by_speaker[s]]
+
+    return sorted(train_files), sorted(val_files), val_speakers
 
 
 class NoisyCleanDataset(Dataset):
@@ -31,26 +74,34 @@ class NoisyCleanDataset(Dataset):
             shorter are zero-padded. 2.0s is a common default for VoiceBank+DEMAND.
         train: if True, crop randomly (data augmentation via random offset).
             If False, crop deterministically from the start — reproducible eval.
+        file_list: optional explicit list of filenames to use instead of every
+            matched file in noisy_dir/clean_dir — e.g. a speaker-disjoint
+            subset from split_train_val_speakers(). When given, it's trusted
+            as already-valid (present in both dirs); the missing-file check
+            below only runs when discovering files from the directories.
     """
 
-    def __init__(self, noisy_dir, clean_dir, segment_seconds=2.0, train=True):
+    def __init__(self, noisy_dir, clean_dir, segment_seconds=2.0, train=True, file_list=None):
         self.noisy_dir = noisy_dir
         self.clean_dir = clean_dir
         self.train = train
         self.segment_len = int(segment_seconds * SAMPLE_RATE)
 
-        noisy_files = set(os.listdir(noisy_dir))
-        clean_files = set(os.listdir(clean_dir))
-        common = sorted(noisy_files & clean_files)
+        if file_list is not None:
+            self.files = sorted(file_list)
+        else:
+            noisy_files = set(os.listdir(noisy_dir))
+            clean_files = set(os.listdir(clean_dir))
+            common = sorted(noisy_files & clean_files)
 
-        missing_noisy = clean_files - noisy_files
-        missing_clean = noisy_files - clean_files
-        if missing_noisy or missing_clean:
-            print(f"[NoisyCleanDataset] WARNING: {len(missing_noisy)} files only in "
-                  f"clean_dir, {len(missing_clean)} only in noisy_dir — skipping those, "
-                  f"using {len(common)} matched pairs.")
+            missing_noisy = clean_files - noisy_files
+            missing_clean = noisy_files - clean_files
+            if missing_noisy or missing_clean:
+                print(f"[NoisyCleanDataset] WARNING: {len(missing_noisy)} files only in "
+                      f"clean_dir, {len(missing_clean)} only in noisy_dir — skipping those, "
+                      f"using {len(common)} matched pairs.")
 
-        self.files = common
+            self.files = common
 
     def __len__(self):
         return len(self.files)

@@ -1,0 +1,10 @@
+{
+  "seed": 42,
+  "num_val_speakers": 2,
+  "val_speakers": [
+    "p230",
+    "p274"
+  ],
+  "train_files": 10724,
+  "val_files": 848
+}

@@ -8,14 +8,19 @@ Changes vs the README skeleton:
 - Loads paths/hyperparameters from configs/config.yaml instead of hardcoding,
   so this file doesn't need to be edited when you move to a new machine.
 - Creates checkpoints/ if it doesn't exist (torch.save fails otherwise).
-- Adds a validation pass on the test set each epoch and only saves the
-  checkpoint when val loss improves, so checkpoints/unet_se.pt is always
-  your best model, not just whatever epoch happened to run last.
+- Adds a validation pass each epoch and only saves the checkpoint when val
+  loss improves, so checkpoints/unet_se.pt is always your best model, not
+  just whatever epoch happened to run last. Validation is a speaker-disjoint
+  split carved out of the TRAINING set (src.data_loader.split_train_val_speakers),
+  never the test directories — those are read only by evaluate.py, once, at
+  the end. Using the test set for checkpoint selection would leak its score
+  into which epoch gets picked as "best", biasing the final reported metrics.
 - Adds tqdm progress bars — with ~11.5k training pairs, a silent loop with
   no feedback for minutes looks hung.
 """
 
 import csv
+import json
 import os
 import time
 
@@ -24,7 +29,7 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data_loader import NoisyCleanDataset
+from src.data_loader import NoisyCleanDataset, split_train_val_speakers
 from src.model import UNetSE
 from src.losses import combined_loss
 
@@ -69,10 +74,12 @@ def main():
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
 
+    # Test directories are intentionally not read here — train.py never sees
+    # them. They exist only for evaluate.py's one-time final scoring; reusing
+    # them for validation/checkpoint-selection here would let that final
+    # score leak into which epoch gets picked as "best".
     noisy_train_dir = data_cfg.get("noisy_train_dir", "data/raw/noisy_trainset_28spk_wav")
     clean_train_dir = data_cfg.get("clean_train_dir", "data/raw/clean_trainset_28spk_wav")
-    noisy_test_dir = data_cfg.get("noisy_test_dir", "data/raw/noisy_testset_wav")
-    clean_test_dir = data_cfg.get("clean_test_dir", "data/raw/clean_testset_wav")
 
     segment_seconds = train_cfg.get("segment_seconds", 2.0)
     batch_size = train_cfg.get("batch_size", 8)
@@ -83,15 +90,35 @@ def main():
     checkpoint_path = train_cfg.get("checkpoint_path", "checkpoints/unet_se.pt")
     log_path = train_cfg.get("log_path", "results/train_log.csv")
     num_workers = train_cfg.get("num_workers", 2)
+    val_speakers_count = train_cfg.get("val_speakers", 2)
+    val_split_seed = train_cfg.get("val_split_seed", 42)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device: {device}")
 
+    train_files, val_files, held_out_speakers = split_train_val_speakers(
+        noisy_train_dir, clean_train_dir, num_val_speakers=val_speakers_count, seed=val_split_seed
+    )
+    print(f"[train] held-out val speakers (seed={val_split_seed}): {held_out_speakers}")
+
+    val_split_path = os.path.join(os.path.dirname(log_path) or ".", "val_split.json")
+    os.makedirs(os.path.dirname(val_split_path) or ".", exist_ok=True)
+    with open(val_split_path, "w") as f:
+        json.dump({
+            "seed": val_split_seed,
+            "num_val_speakers": val_speakers_count,
+            "val_speakers": held_out_speakers,
+            "train_files": len(train_files),
+            "val_files": len(val_files),
+        }, f, indent=2)
+
     train_dataset = NoisyCleanDataset(
-        noisy_train_dir, clean_train_dir, segment_seconds=segment_seconds, train=True
+        noisy_train_dir, clean_train_dir, segment_seconds=segment_seconds, train=True,
+        file_list=train_files,
     )
     val_dataset = NoisyCleanDataset(
-        noisy_test_dir, clean_test_dir, segment_seconds=segment_seconds, train=False
+        noisy_train_dir, clean_train_dir, segment_seconds=segment_seconds, train=False,
+        file_list=val_files,
     )
     print(f"[train] train pairs: {len(train_dataset)}, val pairs: {len(val_dataset)}")
 

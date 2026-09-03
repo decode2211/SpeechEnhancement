@@ -1,9 +1,11 @@
 # NoiseEnhancer training configuration
-# Referenced by src/train.py via load_config("configs/config.yaml")
+# Referenced by src/train.py and src/evaluate.py via load_config("configs/config.yaml")
 
 data:
   noisy_train_dir: data/raw/noisy_trainset_28spk_wav
   clean_train_dir: data/raw/clean_trainset_28spk_wav
+  # noisy_test_dir/clean_test_dir are read ONLY by src/evaluate.py for the
+  # final one-time test-set scoring — src/train.py never touches them.
   noisy_test_dir: data/raw/noisy_testset_wav
   clean_test_dir: data/raw/clean_testset_wav
 
@@ -17,3 +19,5 @@ train:
   checkpoint_path: checkpoints/unet_se.pt
   log_path: results/train_log.csv
   num_workers: 4
+  val_speakers: 2         # number of training-set speakers held out for validation
+  val_split_seed: 42      # seed for which speakers get held out (reproducible split)
