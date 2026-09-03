@@ -15,4 +15,5 @@ train:
   si_sdr_weight: 0.0      # 0 = pure log-magnitude loss; >0 blends in SI-SDR loss
   base_ch: 32
   checkpoint_path: checkpoints/unet_se.pt
-  num_workers: 2
+  log_path: results/train_log.csv
+  num_workers: 4
